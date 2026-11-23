@@ -452,7 +452,7 @@ pre.sql { margin: 0; background: #0c100e; border: 1px solid var(--line); border-
 
 <div id="toast" class="toast hidden" role="status"></div>
 <script>
-/* QD:CORE BEGIN v1.0.0 */
+/* QD:CORE BEGIN v1.3.0 */
 /*
  * Query Desk shared core. One classic script, no dependencies of its own.
  * It expects the sql.js loader (initSqlJs) to be present, or passed to QD.boot.
@@ -466,7 +466,7 @@ pre.sql { margin: 0; background: #0c100e; border: 1px solid var(--line); border-
   'use strict';
 
   var QD = {};
-  QD.VERSION = '1.0.0';
+  QD.VERSION = '1.3.0';
   QD.FORMAT_VERSION = 1;
   QD.SQLJS_VERSION = '1.16.0';
   QD.SQLJS_CDN = 'https://cdn.jsdelivr.net/npm/sql.js@' + QD.SQLJS_VERSION + '/dist/';
@@ -1438,10 +1438,184 @@ pre.sql { margin: 0; background: #0c100e; border: 1px solid var(--line); border-
     return this.objects('SELECT * FROM _qd_queries WHERE id = ?', [id])[0] || null;
   };
   Project.prototype.deleteQuery = function (id) {
+    /* Report blocks that show this query's charts go first, while the charts still exist to find them. */
+    this.db.run("DELETE FROM _qd_notebook WHERE kind = 'chart' AND ref_id IN (SELECT id FROM _qd_charts WHERE query_id = ?)", [id]);
     this.db.run('DELETE FROM _qd_charts WHERE query_id = ?', [id]);
     this.db.run("DELETE FROM _qd_notebook WHERE kind = 'query' AND ref_id = ?", [id]);
     this.db.run('DELETE FROM _qd_queries WHERE id = ?', [id]);
     this._touch('queries');
+  };
+
+  /* ---------------------------------------------------------------- charts */
+
+  QD.CHART_TYPES = ['bar', 'line', 'scatter', 'pie', 'tile'];
+  QD.CHART_SORTS = ['none', 'asc', 'desc'];
+  QD.CHART_KEYS = ['type', 'x', 'y', 'series', 'stacked', 'sort', 'limit', 'title'];
+
+  /**
+   * Check a chart spec against the fixed shape shared by Days 198 and 200:
+   * { type, x, y, series, stacked, sort, limit, title } and nothing else.
+   * Returns { ok, reason }.
+   */
+  QD.validateChartSpec = function (spec) {
+    function no(reason) { return { ok: false, reason: reason }; }
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return no('A chart spec must be an object.');
+    var keys = Object.keys(spec), i;
+    for (i = 0; i < keys.length; i += 1) {
+      if (QD.CHART_KEYS.indexOf(keys[i]) < 0) return no('A chart spec cannot carry ' + keys[i] + '.');
+    }
+    for (i = 0; i < QD.CHART_KEYS.length; i += 1) {
+      if (!(QD.CHART_KEYS[i] in spec)) return no('A chart spec needs ' + QD.CHART_KEYS[i] + '.');
+    }
+    if (QD.CHART_TYPES.indexOf(spec.type) < 0) return no('The chart type must be one of ' + QD.CHART_TYPES.join(', ') + '.');
+    function name(v) { return typeof v === 'string' && v.length > 0 && v.length <= 200; }
+    if (spec.type === 'tile') { if (spec.x !== null && !name(spec.x)) return no('x must be a column name or null.'); }
+    else if (!name(spec.x)) return no('x must be a column name.');
+    if (!Array.isArray(spec.y) || spec.y.length < 1 || spec.y.length > 4) return no('y must list one to four columns.');
+    for (i = 0; i < spec.y.length; i += 1) { if (!name(spec.y[i])) return no('Every y entry must be a column name.'); }
+    if (spec.series !== null && !name(spec.series)) return no('series must be a column name or null.');
+    if (typeof spec.stacked !== 'boolean') return no('stacked must be true or false.');
+    if (QD.CHART_SORTS.indexOf(spec.sort) < 0) return no('sort must be none, asc or desc.');
+    if (typeof spec.limit !== 'number' || Math.floor(spec.limit) !== spec.limit || spec.limit < 1 || spec.limit > 1000) {
+      return no('limit must be a whole number from 1 to 1000.');
+    }
+    if (typeof spec.title !== 'string' || spec.title.length > 200) return no('title must be text of 200 characters or fewer.');
+    return { ok: true, reason: null };
+  };
+
+  function checkSpec(spec) {
+    var v = QD.validateChartSpec(spec);
+    if (!v.ok) { var e = new Error(v.reason); e.kind = 'spec'; throw e; }
+  }
+  function chartRow(r) {
+    var spec = null;
+    try { spec = JSON.parse(r.spec_json); } catch (e) { spec = null; }
+    return { id: r.id, queryId: r.query_id, name: r.name, spec: spec, position: r.position, createdAt: r.created_at };
+  }
+
+  /** Pin a chart. c: { queryId, spec, position }. Without a position it goes to the end of the board. Returns the id. */
+  Project.prototype.saveChart = function (c) {
+    checkSpec(c.spec);
+    var pos = c.position;
+    if (pos == null) pos = Number(this.scalar('SELECT coalesce(max(position), -1) + 1 FROM _qd_charts'));
+    this.db.run('INSERT INTO _qd_charts (query_id, name, spec_json, position, created_at) VALUES (?,?,?,?,?)',
+      [c.queryId == null ? null : c.queryId, c.spec.title || null, JSON.stringify(c.spec), pos, QD.now()]);
+    var id = this.scalar('SELECT last_insert_rowid()');
+    this._touch('charts');
+    return id;
+  };
+  /** Pinned charts in board order. */
+  Project.prototype.charts = function () {
+    return this.objects('SELECT * FROM _qd_charts ORDER BY position, id').map(chartRow);
+  };
+  Project.prototype.updateChart = function (id, spec) {
+    checkSpec(spec);
+    this.db.run('UPDATE _qd_charts SET spec_json = ?, name = ? WHERE id = ?', [JSON.stringify(spec), spec.title || null, id]);
+    this._touch('charts');
+  };
+  /** Move a chart to a zero based place on the board and renumber the rest in order. */
+  Project.prototype.moveChart = function (id, position) {
+    var ids = this.charts().map(function (c) { return c.id; }), from = ids.indexOf(id), db = this.db;
+    if (from < 0) return;
+    ids.splice(from, 1);
+    var to = Math.max(0, Math.min(ids.length, Math.floor(position)));
+    ids.splice(to, 0, id);
+    ids.forEach(function (cid, i) { db.run('UPDATE _qd_charts SET position = ? WHERE id = ?', [i, cid]); });
+    this._touch('charts');
+  };
+  Project.prototype.deleteChart = function (id) {
+    this.db.run('DELETE FROM _qd_charts WHERE id = ?', [id]);
+    this.db.run("DELETE FROM _qd_notebook WHERE kind = 'chart' AND ref_id = ?", [id]);
+    this._touch('charts');
+  };
+
+  /* -------------------------------------------------------- report blocks */
+
+  QD.BLOCK_KINDS = ['text', 'query', 'chart'];
+  QD.BLOCK_BODY_MAX = 20000;
+  QD.REPORT_TITLE_MAX = 200;
+
+  function blockError(reason) { var e = new Error(reason); e.kind = 'spec'; return e; }
+  function blockRow(r) {
+    return { id: r.id, position: r.position, kind: r.kind, refId: r.ref_id, body: r.body, createdAt: r.created_at };
+  }
+  /* Check a block's body: required non empty text for a note, an optional caption for a query or chart. */
+  function checkBody(kind, body) {
+    if (kind === 'text') {
+      if (typeof body !== 'string' || body.trim() === '') throw blockError('A note needs some text.');
+    } else if (body != null && typeof body !== 'string') {
+      throw blockError('A caption must be text.');
+    }
+    if (typeof body === 'string' && body.length > QD.BLOCK_BODY_MAX) {
+      throw blockError('A note or caption can hold at most ' + QD.BLOCK_BODY_MAX + ' characters.');
+    }
+  }
+
+  /**
+   * Add a report block. b: { kind, refId, body, position }. kind is text, query or chart.
+   * A text block carries its note in body and no refId; a query or chart block points at a saved query
+   * or a pinned chart and may carry a caption in body. Without a position it goes to the end. Returns the id.
+   */
+  Project.prototype.addBlock = function (b) {
+    b = b || {};
+    if (QD.BLOCK_KINDS.indexOf(b.kind) < 0) throw blockError('A report block must be a note, a query or a chart.');
+    checkBody(b.kind, b.body);
+    if (b.kind === 'text') {
+      if (b.refId != null) throw blockError('A note does not point at a query or a chart.');
+    } else {
+      if (b.refId == null) throw blockError('A ' + b.kind + ' block needs the ' + (b.kind === 'query' ? 'saved query' : 'pinned chart') + ' it shows.');
+      var table = b.kind === 'query' ? '_qd_queries' : '_qd_charts';
+      if (!Number(this.scalar('SELECT count(*) FROM ' + table + ' WHERE id = ?', [b.refId]))) {
+        throw blockError(b.kind === 'query' ? 'That saved query no longer exists.' : 'That pinned chart no longer exists.');
+      }
+    }
+    var end = Number(this.scalar('SELECT coalesce(max(position), -1) + 1 FROM _qd_notebook'));
+    this.db.run('INSERT INTO _qd_notebook (position, kind, ref_id, body, created_at) VALUES (?,?,?,?,?)',
+      [end, b.kind, b.kind === 'text' ? null : b.refId, b.body == null || b.body === '' ? null : b.body, QD.now()]);
+    var id = this.scalar('SELECT last_insert_rowid()');
+    if (b.position != null) this._placeBlock(id, b.position);
+    this._touch('notebook');
+    return id;
+  };
+  /** Report blocks in report order. */
+  Project.prototype.blocks = function () {
+    return this.objects('SELECT * FROM _qd_notebook ORDER BY position, id').map(blockRow);
+  };
+  /** Change a block's body: the note text, or the caption of a query or chart block. */
+  Project.prototype.updateBlock = function (id, changes) {
+    var r = this.objects('SELECT * FROM _qd_notebook WHERE id = ?', [id])[0];
+    if (!r) throw blockError('That report block no longer exists.');
+    var body = changes ? changes.body : undefined;
+    checkBody(r.kind, body);
+    this.db.run('UPDATE _qd_notebook SET body = ? WHERE id = ?', [body == null || body === '' ? null : body, id]);
+    this._touch('notebook');
+  };
+  Project.prototype._placeBlock = function (id, position) {
+    var ids = this.blocks().map(function (b) { return b.id; }), from = ids.indexOf(id), db = this.db;
+    if (from < 0) return false;
+    ids.splice(from, 1);
+    var to = Math.max(0, Math.min(ids.length, Math.floor(Number(position) || 0)));
+    ids.splice(to, 0, id);
+    ids.forEach(function (bid, i) { db.run('UPDATE _qd_notebook SET position = ? WHERE id = ?', [i, bid]); });
+    return true;
+  };
+  /** Move a block to a zero based place in the report and renumber the rest in order. */
+  Project.prototype.moveBlock = function (id, position) {
+    if (this._placeBlock(id, position)) this._touch('notebook');
+  };
+  Project.prototype.deleteBlock = function (id) {
+    this.db.run('DELETE FROM _qd_notebook WHERE id = ?', [id]);
+    this._touch('notebook');
+  };
+  /** The report title, or the project name when none has been set. */
+  Project.prototype.reportTitle = function () {
+    var t = this.getMeta('report_title');
+    return t ? t : this.name;
+  };
+  Project.prototype.setReportTitle = function (text) {
+    var t = String(text == null ? '' : text).trim();
+    if (t.length > QD.REPORT_TITLE_MAX) throw blockError('A report title can hold at most ' + QD.REPORT_TITLE_MAX + ' characters.');
+    this.setMeta('report_title', t || null);
   };
 
   /* ------------------------------------------------- keys and relationships */
